@@ -152,7 +152,7 @@ test('checking in transitions vehicle status atomically with reservation', async
     id: '15', status: 'checked_in', siteId: '4', employeeId: '8'
   });
 
-  assert.deepEqual(result, { id: '15', status: 'checked_in', employeeId: '8' });
+  assert.deepEqual(result, { id: '15', status: 'checked_in', syncSiteId: '4', employeeId: '8' });
   assert.ok(calls.some(({ sql, params }) =>
     sql === 'UPDATE vehicles SET status = ? WHERE id = ?' && params[0] === 'rented'));
   assert.ok(calls.some(({ sql, params }) =>
@@ -181,7 +181,7 @@ test('return transition records the receiving employee name as a historical snap
     id: '15', status: 'completed', siteId: '4', employeeId: '9'
   });
 
-  assert.deepEqual(result, { id: '15', status: 'completed', employeeId: '9' });
+  assert.deepEqual(result, { id: '15', status: 'completed', syncSiteId: '4', employeeId: '9' });
   assert.ok(calls.some(({ sql, params }) =>
     sql === 'UPDATE reservations SET status = ?, returned_by_employee_id = ?, returned_by_name = ? WHERE id = ?' &&
     params.join('|') === 'completed|9|Receiving Staff|15'));

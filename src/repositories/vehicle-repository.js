@@ -40,13 +40,15 @@ export function createVehicleRepository(db, parkingBoard) {
       );
     },
 
-    async listForParkingSync() {
+    async listForParkingSync(siteId) {
+      const siteFilter = siteId ? ' AND v.site_id = ?' : '';
       return db.query(
         `SELECT v.id, v.registration_number, v.make, v.model, v.site_id
            FROM vehicles v
            JOIN sites s ON s.id = v.site_id
-          WHERE s.status = 'active' AND v.status <> 'retired'
-          ORDER BY v.id`
+          WHERE s.status = 'active' AND v.status <> 'retired'${siteFilter}
+          ORDER BY v.id`,
+        siteId ? [siteId] : []
       );
     },
 

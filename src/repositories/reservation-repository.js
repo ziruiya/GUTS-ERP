@@ -188,7 +188,10 @@ export function createReservationRepository(db) {
         } else {
           await tx.query('UPDATE reservations SET status = ? WHERE id = ?', [status, id]);
         }
-        return { id: String(id), status, ...(employeeColumn ? { employeeId: String(employeeId) } : {}) };
+        return {
+          id: String(id), status, syncSiteId: String(reservation.site_id),
+          ...(employeeColumn ? { employeeId: String(employeeId) } : {})
+        };
       });
     }
   };

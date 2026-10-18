@@ -84,6 +84,15 @@ export function createAuthService({ accounts, sessions, jwt, config }) {
       return createSession(account, await accounts.listPermissions(account.id));
     },
 
+    async switchToAccount(accountId) {
+      const account = await accounts.findById(accountId);
+      if (!account || account.status !== 'active' || account.site_status !== 'active' ||
+          account.site_type === 'headquarters' || Number(account.is_owner_admin) === 1) {
+        return null;
+      }
+      return createSession(account, await accounts.listPermissions(account.id));
+    },
+
     async refresh(refreshToken) {
       if (typeof refreshToken !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(refreshToken)) {
         return null;

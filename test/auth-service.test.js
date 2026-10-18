@@ -181,6 +181,48 @@ test('site switching refuses disabled, headquarters, and owner-admin accounts', 
   assert.equal(await auth.switchToSite('2'), null);
 });
 
+test('account switching uses the selected account and refuses inactive or privileged accounts', async () => {
+  const accountsById = new Map([
+    ['14', {
+      id: '14', site_id: '2', username: 'store-user', display_name: 'Store User',
+      is_owner_admin: 0, status: 'active', site_code: 'TOKYO', site_type: 'direct',
+      site_status: 'active', site_name: 'Tokyo'
+    }],
+    ['15', {
+      id: '15', site_id: '3', username: 'disabled-user', display_name: 'Disabled',
+      is_owner_admin: 0, status: 'disabled', site_code: 'OSAKA', site_type: 'franchise',
+      site_status: 'active', site_name: 'Osaka'
+    }],
+    ['1', {
+      id: '1', site_id: '1', username: 'admin', display_name: 'Admin',
+      is_owner_admin: 1, status: 'active', site_code: 'HQ', site_type: 'headquarters',
+      site_status: 'active', site_name: 'Headquarters'
+    }]
+  ]);
+  let claims;
+  const auth = createAuthService({
+    sessions: { create: async () => {}, findByTokenHash: async () => null },
+    accounts: {
+      findById: async (id) => accountsById.get(String(id)) ?? null,
+      listPermissions: async (id) => id === '14' ? ['customers:read'] : []
+    },
+    jwt: { sign: (payload) => { claims = payload; return 'selected-account-token'; } },
+    config: { jwt: { issuer: 'erp', audience: 'guts-parking', expiresIn: 3600, refreshExpiresIn: 2592000 } }
+  });
+
+  const session = await auth.switchToAccount('14');
+  assert.equal(session.accessToken, 'selected-account-token');
+  assert.equal(session.account.id, '14');
+  assert.equal(session.account.site.id, '2');
+  assert.deepEqual(claims, {
+    sub: '14', username: 'store-user', siteId: '2', siteCode: 'TOKYO',
+    siteType: 'direct', permissions: ['customers:read']
+  });
+  assert.equal(await auth.switchToAccount('15'), null);
+  assert.equal(await auth.switchToAccount('1'), null);
+  assert.equal(await auth.switchToAccount('99'), null);
+});
+
 test('refresh refuses disabled accounts before rotating the session token', async () => {
   let rotated = false;
   const auth = createAuthService({

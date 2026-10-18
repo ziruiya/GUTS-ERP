@@ -14,5 +14,6 @@ test('page routing rejects unknown and unauthorized pages', () => {
   assert.equal(pageFromHash('#accounts', allowedPages), 'dashboard');
   assert.equal(pageFromHash('#not-a-page', allowedPages), 'dashboard');
   assert.equal(pageHash('vehicles'), '#vehicles');
+  assert.equal(pageHash('accounts'), '#dashboard');
   assert.equal(pageHash('not-a-page'), '#dashboard');
 });

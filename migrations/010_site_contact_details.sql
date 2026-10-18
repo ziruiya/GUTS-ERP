@@ -1,0 +1,3 @@
+ALTER TABLE sites
+  ADD COLUMN address VARCHAR(500) NULL AFTER name,
+  ADD COLUMN phone VARCHAR(32) NULL AFTER address;
