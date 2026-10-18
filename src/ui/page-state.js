@@ -1,5 +1,5 @@
 const pages = new Set([
-  'dashboard', 'reservations', 'sites', 'accounts', 'vehicles', 'parking'
+  'dashboard', 'reservations', 'sites', 'vehicles', 'parking'
 ]);
 
 export function pageFromHash(hash, allowedPages) {

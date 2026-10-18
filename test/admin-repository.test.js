@@ -58,3 +58,76 @@ test('account list includes owner-admin marker without exposing password hashes'
   assert.doesNotMatch(call.sql, /password_hash/);
   assert.deepEqual(call.params, ['%admin%', '%admin%', '%admin%', '%admin%', 50, 0]);
 });
+
+test('site details include contact and aggregate vehicle counts by status and class', async () => {
+  const statements = [];
+  const repository = createAdminRepository({
+    query: async (sql, params = []) => {
+      statements.push({ sql, params });
+      if (sql.startsWith('SELECT s.id')) {
+        return [{
+          id: '2', name: 'Tokyo', address: 'Tokyo address', phone: '03-1234-5678',
+          created_at: '2026-10-18T00:00:00.000Z', vehicle_count: 4, account_count: 2
+        }];
+      }
+      if (sql.includes('SELECT status, COUNT(*)')) {
+        return [{ status: 'available', count: 3 }, { status: 'rented', count: 1 }];
+      }
+      if (sql.includes('SELECT pv.vehicle_type AS name')) {
+        return [{ name: 'A-1', count: 2 }, { name: 'B', count: 2 }];
+      }
+      return [];
+    }
+  });
+
+  const [site] = await repository.listSites('2');
+  const vehicleCounts = await repository.listSiteVehicleCounts('2');
+  assert.equal(site.address, 'Tokyo address');
+  assert.equal(site.phone, '03-1234-5678');
+  assert.equal(Number(site.vehicle_count), 4);
+  assert.equal(Number(site.account_count), 2);
+  assert.deepEqual(vehicleCounts.classes.map(({ name }) => name), ['A-1', 'B']);
+  assert.deepEqual(vehicleCounts.statuses.map(({ status }) => status), ['available', 'rented']);
+  assert.ok(statements.some(({ sql }) => sql.includes("v.status <> 'retired'")));
+});
+
+test('site status update preserves headquarters and allows restoring a store', async () => {
+  const updates = [];
+  const repository = createAdminRepository({
+    query: async (sql, params = []) => {
+      if (sql.includes('SELECT id FROM sites')) {
+        return params[0] === '1' ? [] : [{ id: String(params[0]) }];
+      }
+      if (sql.startsWith('UPDATE sites')) {
+        updates.push(params);
+      }
+      return [];
+    }
+  });
+
+  assert.equal(await repository.updateSiteStatus('1', 'inactive'), null);
+  assert.deepEqual(await repository.updateSiteStatus('2', 'inactive'), { id: '2', status: 'inactive' });
+  assert.deepEqual(await repository.updateSiteStatus('2', 'active'), { id: '2', status: 'active' });
+  assert.deepEqual(updates, [['inactive', '2'], ['active', '2']]);
+});
+
+test('site contact update stores and clears address and phone', async () => {
+  const updates = [];
+  const repository = createAdminRepository({
+    query: async (sql, params = []) => {
+      if (sql.startsWith('SELECT id FROM sites')) return [{ id: String(params[0]) }];
+      if (sql.startsWith('UPDATE sites')) updates.push(params);
+      return [];
+    }
+  });
+  assert.deepEqual(await repository.updateSiteContact('2', {
+    address: 'Tokyo', phone: '03-1234-5678'
+  }), { id: '2', address: 'Tokyo', phone: '03-1234-5678' });
+  assert.deepEqual(await repository.updateSiteContact('2', { address: null, phone: null }), {
+    id: '2', address: null, phone: null
+  });
+  assert.deepEqual(updates, [
+    ['Tokyo', '03-1234-5678', '2'],
+    [null, null, '2']
+  ]);
+});

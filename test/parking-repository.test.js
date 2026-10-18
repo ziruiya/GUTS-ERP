@@ -34,9 +34,14 @@ test('parking bootstrap loads the full ERP-backed board only for the requested s
         navigation_url: '', markings: '[]', capacity: null, is_active: 1, class_priority: '[]'
       }];
       if (sql.includes('FROM parking_vehicles WHERE')) return [{
-        id: '101', external_id: 'erp-vehicle', plate: '品川500あ1234', vehicle_type: 'A-1',
+        id: '101', external_id: 'erp-vehicle', erp_vehicle_id: 'erp-vehicle',
+        plate: '品川500あ1234', vehicle_type: 'A-1',
         parking_lot_id: '11', position_x: '0.25', position_y: '0.75',
         unwashed: 1, no_fuel: 0, needs_repair: 1, options: '["ETC"]', notes: 'memo'
+      }];
+      if (sql.includes('FROM reservations')) return [{
+        vehicle_id: 'erp-vehicle', status: 'reserved',
+        start_at: '2026-10-20 09:00:00', reservation_count: '1'
       }];
       if (sql.includes('FROM parking_vehicle_statuses')) return [{
         id: '21', name: '洗車待ち', icon: '🫧', key: 'unwashed'
@@ -79,9 +84,12 @@ test('parking bootstrap loads the full ERP-backed board only for the requested s
   };
 
   const result = await createParkingRepository(db).bootstrap('3');
-  assert.equal(seen.length, 14);
+  assert.equal(seen.length, 15);
   assert(seen.every(({ params }) => params[0] === '3'));
   assert(result.vehicles[0].unwashed);
+  assert.deepEqual(result.vehicles[0].reservation, {
+    status: 'reserved', start_at: '2026-10-20 09:00:00', reservation_count: 1
+  });
   assert.equal(result.vehicles[0].position_x, 0.25);
   assert.deepEqual(result.vehicles[0].status_ids, [21]);
   assert.deepEqual(result.vehicles[0].assessment_values, { 31: '5' });
@@ -321,6 +329,51 @@ test('parking area create and edit are persisted using the ERP site scope', asyn
   assert.equal(created.display_order, 2);
   const updated = await repository.updateLot({
     siteId: '3', lotId: '21', fields: { is_active: false }
+  });
+
+  test('Google Maps coordinates produce local straight-line parking distances', async () => {
+    const writes = [];
+    const db = {
+      async query(sql) {
+        if (sql.includes('MAX(display_order)')) return [{ next_order: 2 }];
+        if (sql.startsWith('INSERT INTO parking_lots')) return { insertId: 13 };
+        if (sql.includes('SELECT id, name, display_order')) return [{
+          id: '13', name: '新宿', display_order: 2, area_height: 210, area_width: 50,
+          navigation_url: 'https://www.google.com/maps?query=35.6895%2C139.6917',
+          markings: '[]', capacity: null, is_active: 1, class_priority: '[]'
+        }];
+        if (sql.includes('FROM parking_lots WHERE site_id')) return [
+          { id: '12', navigation_url: 'https://www.google.com/maps/@35.6812,139.7671,17z' },
+          { id: '13', navigation_url: 'https://www.google.com/maps?query=35.6895%2C139.6917' }
+        ];
+        if (sql.includes('FROM parking_stores WHERE site_id')) return [
+          { id: '20', navigation_url: 'https://www.google.com/maps/place/?q=35.6812,139.7671' }
+        ];
+        return { affectedRows: 1 };
+      },
+      async transaction(callback) {
+        return callback({
+          async query(sql, params) {
+            writes.push({ sql, params });
+            return { affectedRows: 1 };
+          }
+        });
+      }
+    };
+    const lot = await createParkingRepository(db).createLot({
+      siteId: '3', name: '新宿', navigationUrl: 'https://www.google.com/maps?query=35.6895%2C139.6917'
+    });
+    assert.equal(lot.id, 13);
+    const lotDistanceWrites = writes.filter(({ sql }) => sql.includes('INSERT INTO parking_lot_distances'));
+    const storeDistanceWrites = writes.filter(({ sql }) => sql.includes('INSERT INTO parking_store_lot_distances'));
+    assert.equal(lotDistanceWrites.length, 1);
+    assert.equal(storeDistanceWrites.length, 1);
+    assert.equal(lotDistanceWrites[0].params.length, 8);
+    assert.equal(storeDistanceWrites[0].params.length, 8);
+    assert([lotDistanceWrites[0].params[3], lotDistanceWrites[0].params[7]]
+      .every((distance) => distance > 6 && distance < 8));
+    assert(writes.some(({ sql }) => sql.includes('DELETE FROM parking_lot_distances') &&
+      sql.includes('km_auto = 1')));
   });
   assert.equal(updated.is_active, false);
   assert(calls.every(({ sql }) => !sql.includes('WHERE id = ? AND site_id = ?') ||

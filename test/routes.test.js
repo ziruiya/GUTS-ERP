@@ -17,13 +17,15 @@ async function makeApp(user) {
     customerList: null, createdCustomer: null, updatedCustomer: null,
     reservationCatalogSiteScope: null, availableVehicleQuery: null,
     createdAccount: null, updatedAccount: null, accountListFilters: [],
+    createdSite: null, siteStatusUpdate: null, siteContactUpdate: null, switchedAccountId: null,
     employeeList: null, createdEmployee: null, updatedEmployee: null,
     parkingSyncVehicles: null, parkingSyncResult: { created: 1, updated: 0, synced: 1 },
     parkingSyncError: null,
     parkingBootstrapSiteScope: null, parkingVehicleCatalogSiteScope: null, parkingUpdate: null,
     parkingJobCreate: null, parkingJobUpdate: null, parkingJobDelete: null, parkingPublished: [],
     parkingLotCreate: null, parkingLotUpdate: null, parkingLotDelete: null, parkingLotOrder: null,
-    parkingCatalogWrites: [], parkingLogisticsWrites: [], revokedRefreshTokens: []
+    parkingCatalogWrites: [], parkingLogisticsWrites: [], revokedRefreshTokens: [],
+    parkingSyncMarked: []
   };
   const loggedErrors = [];
   const app = Fastify({ logger: false });
@@ -52,6 +54,23 @@ async function makeApp(user) {
       listSites: async (siteId) => siteId
         ? [{ id: siteId, code: 'SHOP', name: 'Shop', type: 'direct', status: 'active' }]
         : [],
+      createSite: async (site) => {
+        calls.createdSite = site;
+        return { id: '22', ...site, status: 'active' };
+      },
+      listSiteVehicleCounts: async (siteId) => ({
+        statuses: [{ status: 'available', count: 3 }],
+        classes: [{ name: `Class ${siteId}`, count: 3 }]
+      }),
+      updateSiteStatus: async (id, status) => {
+        if (String(id) === '1') return null;
+        calls.siteStatusUpdate = { id, status };
+        return { id, status };
+      },
+      updateSiteContact: async (id, contact) => {
+        calls.siteContactUpdate = { id, ...contact };
+        return { id, ...contact };
+      },
       listAccounts: async (filters) => {
         calls.accountListFilters.push(filters);
         return user.listedAccounts ?? [];
@@ -159,6 +178,23 @@ async function makeApp(user) {
           refreshToken: 'S'.repeat(43)
         };
       },
+      switchToAccount: async (accountId) => {
+        calls.switchedAccountId = accountId;
+        const account = accountsById.get(String(accountId));
+        if (!account || account.status !== 'active' || account.site_status !== 'active' ||
+            account.site_type === 'headquarters' || Number(account.is_owner_admin) === 1) return null;
+        const permissions = permissionsByAccount[String(account.id)] ?? [];
+        return {
+          accessToken: app.jwt.sign({
+            sub: String(account.id), username: account.username,
+            siteId: String(account.site_id), siteCode: account.site_code,
+            siteType: account.site_type, permissions
+          }, {
+            issuer: jwtConfig.issuer, audience: jwtConfig.audience, expiresIn: 300
+          }),
+          refreshToken: 'S'.repeat(43)
+        };
+      },
       ...(user.auth ?? {})
     },
     parkingBoard: {
@@ -210,6 +246,10 @@ async function makeApp(user) {
       },
       deleteVehicleOption: async (input) => { calls.parkingCatalogWrites.push(['delete-option', input]); return true; },
       createStore: async (input) => { calls.parkingLogisticsWrites.push(['store', input]); return { id: 61 }; },
+      updateStoreNavigationUrl: async (input) => {
+        calls.parkingLogisticsWrites.push(['store-location', input]);
+        return true;
+      },
       deleteStore: async (input) => { calls.parkingLogisticsWrites.push(['delete-store', input]); return true; },
       updateLotDistances: async (input) => { calls.parkingLogisticsWrites.push(['lot-distances', input]); return { updated: input.entries.length }; },
       updateStoreLotDistances: async (input) => { calls.parkingLogisticsWrites.push(['store-distances', input]); return { updated: input.entries.length }; },
@@ -223,7 +263,8 @@ async function makeApp(user) {
     parkingRealtime: {
       issue: (siteId, accountId) => `ticket:${siteId}:${accountId}`,
       publish: (siteId) => calls.parkingPublished.push(siteId)
-    }
+    },
+    parkingSync: { markDirty: (siteId) => calls.parkingSyncMarked.push(String(siteId)) }
   }, { record: (entry) => loggedErrors.push(entry) });
   const token = app.jwt.sign(user, {
     issuer: jwtConfig.issuer,
@@ -332,6 +373,200 @@ test('only the owner admin can switch to a site account and the issued token is 
     method: 'POST', url: '/api/v1/auth/switch-site',
     headers: { authorization: `Bearer ${regular.token}` },
     payload: { siteId: '2' }
+  });
+  assert.equal(denied.statusCode, 403);
+});
+
+test('owner admin can switch to the exact active account with only that account scope', async (t) => {
+  const storeAccount = {
+    id: '22', username: 'store-operator', display_name: 'Store Operator', is_owner_admin: 0,
+    site_id: '2', site_code: 'TOKYO', site_name: 'Tokyo', site_type: 'direct',
+    status: 'active', site_status: 'active'
+  };
+  const owner = await makeApp({
+    sub: '1', siteId: '1', siteType: 'headquarters', permissions: ['accounts:write'],
+    profile: {
+      id: '1', is_owner_admin: 1, status: 'active', site_status: 'active',
+      site_id: '1', site_type: 'headquarters'
+    },
+    accounts: { '22': storeAccount },
+    accountPermissions: { '22': ['reservations:read'] }
+  });
+  t.after(() => owner.app.close());
+
+  const response = await owner.app.inject({
+    method: 'POST',
+    url: '/api/v1/auth/switch-account',
+    headers: { authorization: `Bearer ${owner.token}` },
+    payload: { accountId: '22' }
+  });
+  assert.equal(response.statusCode, 200);
+  assert.equal(owner.calls.switchedAccountId, '22');
+  const claims = owner.app.jwt.verify(response.json().accessToken);
+  assert.equal(claims.sub, '22');
+  assert.equal(claims.siteId, '2');
+  assert.deepEqual(claims.permissions, ['reservations:read']);
+  assert.equal(response.json().refreshToken, undefined);
+  assert.match(response.headers['set-cookie'], /guts_erp_site_refresh=S{43}; HttpOnly/);
+
+  const regular = await makeApp({
+    sub: '22', siteId: '2', siteType: 'direct', permissions: [],
+    profile: { ...storeAccount, id: '22', site_id: '2' },
+    accounts: { '22': storeAccount }
+  });
+  t.after(() => regular.app.close());
+  const denied = await regular.app.inject({
+    method: 'POST', url: '/api/v1/auth/switch-account',
+    headers: { authorization: `Bearer ${regular.token}` },
+    payload: { accountId: '22' }
+  });
+  assert.equal(denied.statusCode, 403);
+});
+
+test('site details expose scoped contact, account, and vehicle summaries', async (t) => {
+  const owner = await makeApp({
+    sub: '1', siteId: '1', siteType: 'headquarters', permissions: ['sites:read'],
+    profile: {
+      id: '1', is_owner_admin: 1, status: 'active', site_status: 'active',
+      site_id: '1', site_type: 'headquarters'
+    }
+  });
+  t.after(() => owner.app.close());
+
+  const detail = await owner.app.inject({
+    method: 'GET', url: '/api/v1/sites/2',
+    headers: { authorization: `Bearer ${owner.token}` }
+  });
+  assert.equal(detail.statusCode, 200);
+  assert.deepEqual(detail.json().vehicle_counts.classes, [{ name: 'Class 2', count: 3 }]);
+  assert.equal(detail.json().id, '2');
+
+  const store = await makeApp({
+    sub: '14', siteId: '2', siteType: 'direct', permissions: ['sites:read'],
+    profile: {
+      id: '14', is_owner_admin: 0, status: 'active', site_status: 'active',
+      site_id: '2', site_type: 'direct'
+    }
+  });
+  t.after(() => store.app.close());
+  const ownSite = await store.app.inject({
+    method: 'GET', url: '/api/v1/sites/2',
+    headers: { authorization: `Bearer ${store.token}` }
+  });
+  assert.equal(ownSite.statusCode, 200);
+  assert.equal(ownSite.json().account_count, undefined);
+  assert.equal(ownSite.json().has_active_account, undefined);
+  const crossSite = await store.app.inject({
+    method: 'GET', url: '/api/v1/sites/3',
+    headers: { authorization: `Bearer ${store.token}` }
+  });
+  assert.equal(crossSite.statusCode, 404);
+});
+
+test('only owner admin can deactivate or restore non-headquarters sites', async (t) => {
+  const owner = await makeApp({
+    sub: '1', siteId: '1', siteType: 'headquarters', permissions: [],
+    profile: {
+      id: '1', is_owner_admin: 1, status: 'active', site_status: 'active',
+      site_id: '1', site_type: 'headquarters'
+    }
+  });
+  t.after(() => owner.app.close());
+  const headers = { authorization: `Bearer ${owner.token}` };
+  const stopped = await owner.app.inject({
+    method: 'PATCH', url: '/api/v1/sites/2', headers, payload: { status: 'inactive' }
+  });
+  assert.equal(stopped.statusCode, 200);
+  assert.deepEqual(owner.calls.siteStatusUpdate, { id: '2', status: 'inactive' });
+
+  const restored = await owner.app.inject({
+    method: 'PATCH', url: '/api/v1/sites/2', headers, payload: { status: 'active' }
+  });
+  assert.equal(restored.statusCode, 200);
+  assert.deepEqual(owner.calls.siteStatusUpdate, { id: '2', status: 'active' });
+
+  const headquarters = await owner.app.inject({
+    method: 'PATCH', url: '/api/v1/sites/1', headers, payload: { status: 'inactive' }
+  });
+  assert.equal(headquarters.statusCode, 404);
+
+  const regular = await makeApp({
+    sub: '14', siteId: '2', siteType: 'direct', permissions: ['sites:write'],
+    profile: {
+      id: '14', is_owner_admin: 0, status: 'active', site_status: 'active',
+      site_id: '2', site_type: 'direct'
+    }
+  });
+  t.after(() => regular.app.close());
+  const denied = await regular.app.inject({
+    method: 'PATCH', url: '/api/v1/sites/2',
+    headers: { authorization: `Bearer ${regular.token}` }, payload: { status: 'inactive' }
+  });
+  assert.equal(denied.statusCode, 403);
+});
+
+test('site creation saves optional address and phone under the owner admin', async (t) => {
+  const owner = await makeApp({
+    sub: '1', siteId: '1', siteType: 'headquarters', permissions: ['sites:write'],
+    profile: {
+      id: '1', is_owner_admin: 1, status: 'active', site_status: 'active',
+      site_id: '1', site_type: 'headquarters'
+    }
+  });
+  t.after(() => owner.app.close());
+  const response = await owner.app.inject({
+    method: 'POST', url: '/api/v1/sites',
+    headers: { authorization: `Bearer ${owner.token}` },
+    payload: {
+      code: 'TKY-002', name: 'Tokyo North', type: 'direct',
+      address: 'Tokyo address', phone: '03-1234-5678'
+    }
+  });
+  assert.equal(response.statusCode, 201);
+  assert.deepEqual(owner.calls.createdSite, {
+    code: 'TKY-002', name: 'Tokyo North', type: 'direct',
+    address: 'Tokyo address', phone: '03-1234-5678'
+  });
+});
+
+test('only owner admin can update site contact details and can clear them', async (t) => {
+  const owner = await makeApp({
+    sub: '1', siteId: '1', siteType: 'headquarters', permissions: [],
+    profile: {
+      id: '1', is_owner_admin: 1, status: 'active', site_status: 'active',
+      site_id: '1', site_type: 'headquarters'
+    }
+  });
+  t.after(() => owner.app.close());
+  const response = await owner.app.inject({
+    method: 'PATCH', url: '/api/v1/sites/2/contact',
+    headers: { authorization: `Bearer ${owner.token}` },
+    payload: { address: '  Tokyo address  ', phone: '  03-1234-5678  ' }
+  });
+  assert.equal(response.statusCode, 200);
+  assert.deepEqual(owner.calls.siteContactUpdate, {
+    id: '2', address: 'Tokyo address', phone: '03-1234-5678'
+  });
+  const cleared = await owner.app.inject({
+    method: 'PATCH', url: '/api/v1/sites/2/contact',
+    headers: { authorization: `Bearer ${owner.token}` },
+    payload: { address: '', phone: '' }
+  });
+  assert.equal(cleared.statusCode, 200);
+  assert.deepEqual(owner.calls.siteContactUpdate, { id: '2', address: null, phone: null });
+
+  const regular = await makeApp({
+    sub: '14', siteId: '2', siteType: 'direct', permissions: ['sites:write'],
+    profile: {
+      id: '14', is_owner_admin: 0, status: 'active', site_status: 'active',
+      site_id: '2', site_type: 'direct'
+    }
+  });
+  t.after(() => regular.app.close());
+  const denied = await regular.app.inject({
+    method: 'PATCH', url: '/api/v1/sites/2/contact',
+    headers: { authorization: `Bearer ${regular.token}` },
+    payload: { address: '', phone: '' }
   });
   assert.equal(denied.statusCode, 403);
 });
@@ -547,6 +782,7 @@ test('headquarters vehicle creation defaults to the administrator home site', as
   });
   assert.equal(response.statusCode, 201);
   assert.equal(calls.createdVehicle.siteId, '1');
+  assert.deepEqual(calls.parkingSyncMarked, ['1']);
 });
 
 test('parking class selection creates the ERP vehicle and scopes its parking link to the selected site', async (t) => {
@@ -585,6 +821,7 @@ test('parking class selection creates the ERP vehicle and scopes its parking lin
   assert.equal(calls.createdVehicle.model, '');
   assert.equal(calls.createdVehicle.inspectionExpiryDate, '2027-03-31');
   assert.equal(calls.createdVehicle.statutoryInspectionDate, '2026-10-16');
+  assert.deepEqual(calls.parkingSyncMarked, ['2']);
   assert.equal(calls.createdVehicle.parkingClass, 'A-1');
   assert.equal(calls.createdVehicle.parkingLotId, 3);
   assert.deepEqual(calls.createdVehicle.parkingStatusIds, [4]);
@@ -804,6 +1041,7 @@ test('reservation endpoints scope reception staff to their own site', async (t) 
   assert.equal(calls.createdReservation.siteId, '2');
   assert.equal(calls.createdReservation.createdBy, '14');
   assert.equal(calls.createdReservation.startAt, '2026-11-01 09:00:00.000');
+  assert.deepEqual(calls.parkingSyncMarked, ['2']);
 
   const transition = await app.inject({
     method: 'PATCH', url: '/api/v1/reservations/23', headers,
@@ -812,6 +1050,7 @@ test('reservation endpoints scope reception staff to their own site', async (t) 
   assert.equal(transition.statusCode, 200);
   assert.equal(calls.transitionedReservation.siteId, '2');
   assert.equal(calls.transitionedReservation.employeeId, '8');
+  assert.deepEqual(calls.parkingSyncMarked, ['2', '2']);
 
   const missingEmployee = await app.inject({
     method: 'PATCH', url: '/api/v1/reservations/23', headers,
@@ -845,6 +1084,7 @@ test('headquarters reservation creation defaults to the administrator home site'
   assert.equal(response.statusCode, 201);
   assert.equal(calls.createdReservation.siteId, '1');
   assert.equal(calls.createdReservation.createdBy, '1');
+  assert.deepEqual(calls.parkingSyncMarked, ['1']);
 });
 
 test('parking sync requires headquarters vehicle read and write permissions', async (t) => {
@@ -1218,6 +1458,11 @@ test('parking status, class, and option catalogs share ERP parking admin permiss
       method: 'POST', url: '/api/v1/parking/stores', headers, payload: { name: 'Central' }
     });
     assert.equal(createStore.statusCode, 201);
+    const updateStore = await app.inject({
+      method: 'PATCH', url: '/api/v1/parking/stores/61', headers,
+      payload: { navigation_url: 'https://www.google.com/maps/@35.6812,139.7671,17z' }
+    });
+    assert.equal(updateStore.statusCode, 204);
     const lotDistances = await app.inject({
       method: 'PUT', url: '/api/v1/parking/lot-distances', headers,
       payload: { entries: [{ from_lot_id: 1, to_lot_id: 2, minutes: 10, km: 2.5 }] }
@@ -1239,7 +1484,10 @@ test('parking status, class, and option catalogs share ERP parking admin permiss
     });
     assert.equal(damage.statusCode, 201);
     assert.deepEqual(calls.parkingLogisticsWrites, [
-      ['store', { siteId: '8', name: 'Central' }],
+      ['store', { siteId: '8', name: 'Central', navigationUrl: '' }],
+      ['store-location', {
+        siteId: '8', storeId: '61', navigationUrl: 'https://www.google.com/maps/@35.6812,139.7671,17z'
+      }],
       ['lot-distances', { siteId: '8', entries: [{ from_lot_id: 1, to_lot_id: 2, minutes: 10, km: 2.5 }] }],
       ['store-distances', { siteId: '8', entries: [{ store_id: 3, lot_id: 1, minutes: 5, km: null }] }],
       ['assessment', { siteId: '8', name: 'Seat condition', fieldType: 'rating', suffix: 'pt' }],

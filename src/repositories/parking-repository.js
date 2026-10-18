@@ -27,12 +27,97 @@ function parkingLotFromRow(row) {
   };
 }
 
+function googleMapsCoordinates(value) {
+  if (typeof value !== 'string' || !value) return null;
+  let decoded = value;
+  try {
+    decoded = decodeURIComponent(value);
+  } catch {
+    // Keep the original URL when it contains malformed escapes.
+  }
+  const patterns = [
+    /@(-?\d{1,2}(?:\.\d+)?),\s*(-?\d{1,3}(?:\.\d+)?)/,
+    /!3d(-?\d{1,2}(?:\.\d+)?)!4d(-?\d{1,3}(?:\.\d+)?)/,
+    /(?:[?&](?:q|query|destination|daddr)=)(-?\d{1,2}(?:\.\d+)?),\s*(-?\d{1,3}(?:\.\d+)?)/
+  ];
+  for (const pattern of patterns) {
+    const match = decoded.match(pattern);
+    if (!match) continue;
+    const latitude = Number(match[1]);
+    const longitude = Number(match[2]);
+    if (latitude >= -90 && latitude <= 90 && longitude >= -180 && longitude <= 180) {
+      return { latitude, longitude };
+    }
+  }
+  return null;
+}
+
+function straightLineDistanceKm(first, second) {
+  const radians = (degrees) => degrees * Math.PI / 180;
+  const latitudeDelta = radians(second.latitude - first.latitude);
+  const longitudeDelta = radians(second.longitude - first.longitude);
+  const haversine = Math.sin(latitudeDelta / 2) ** 2 +
+    Math.cos(radians(first.latitude)) * Math.cos(radians(second.latitude)) *
+    Math.sin(longitudeDelta / 2) ** 2;
+  return Math.round(6371.0088 * 2 * Math.atan2(Math.sqrt(haversine), Math.sqrt(1 - haversine)) * 1000) / 1000;
+}
+
 const parkingPositionGrid = Array.from({ length: 32 }, (_, index) => [
   [0.125, 0.375, 0.625, 0.875][index % 4],
   [0.0625, 0.1875, 0.3125, 0.4375, 0.5625, 0.6875, 0.8125, 0.9375][Math.floor(index / 4)]
 ]);
 
 export function createParkingRepository(db) {
+  async function updateCoordinateDistances(siteId) {
+    const [lots, stores] = await Promise.all([
+      db.query('SELECT id, navigation_url FROM parking_lots WHERE site_id = ?', [siteId]),
+      db.query('SELECT id, navigation_url FROM parking_stores WHERE site_id = ?', [siteId])
+    ]);
+    return db.transaction(async (tx) => {
+      await Promise.all([
+        tx.query('DELETE FROM parking_lot_distances WHERE site_id = ? AND km_auto = 1', [siteId]),
+        tx.query('DELETE FROM parking_store_lot_distances WHERE site_id = ? AND km_auto = 1', [siteId])
+      ]);
+      const insertAutoDistances = async (table, columns, rows) => {
+        for (let index = 0; index < rows.length; index += 500) {
+          const batch = rows.slice(index, index + 500);
+          const rowValues = batch.map(() => '(?, ?, ?, NULL, ?, 1)').join(', ');
+          await tx.query(
+            `INSERT INTO ${table} (${columns}, minutes, km, km_auto)
+             VALUES ${rowValues}
+             ON DUPLICATE KEY UPDATE km = IF(km_auto = 1, VALUES(km), km),
+               km_auto = IF(km_auto = 1, 1, km_auto)`,
+            batch.flat()
+          );
+        }
+      };
+      const lotCoordinates = lots.map((lot) => ({
+        id: lot.id, coordinates: googleMapsCoordinates(lot.navigation_url)
+      })).filter((lot) => lot.coordinates);
+      const lotDistances = [];
+      for (const from of lotCoordinates) {
+        for (const to of lotCoordinates) {
+          if (String(from.id) === String(to.id)) continue;
+          lotDistances.push([
+            siteId, from.id, to.id, straightLineDistanceKm(from.coordinates, to.coordinates)
+          ]);
+        }
+      }
+      const storeDistances = [];
+      for (const store of stores) {
+        const storeCoordinates = googleMapsCoordinates(store.navigation_url);
+        if (!storeCoordinates) continue;
+        for (const lot of lotCoordinates) {
+          storeDistances.push([
+            siteId, store.id, lot.id, straightLineDistanceKm(storeCoordinates, lot.coordinates)
+          ]);
+        }
+      }
+      await insertAutoDistances('parking_lot_distances', 'site_id, from_lot_id, to_lot_id', lotDistances);
+      await insertAutoDistances('parking_store_lot_distances', 'site_id, store_id, lot_id', storeDistances);
+    });
+  }
+
   return {
     async nextVehiclePosition({ siteId, parkingLotId }, transaction) {
       if (parkingLotId === undefined || parkingLotId === null) {
@@ -83,6 +168,7 @@ export function createParkingRepository(db) {
            FROM parking_lots WHERE id = ? AND site_id = ?`,
         [result.insertId, siteId]
       );
+      if (navigationUrl) await updateCoordinateDistances(siteId);
       return parkingLotFromRow(rows[0]);
     },
 
@@ -128,6 +214,7 @@ export function createParkingRepository(db) {
            FROM parking_lots WHERE id = ? AND site_id = ? LIMIT 1`,
         [lotId, siteId]
       );
+      if (fields.navigation_url !== undefined) await updateCoordinateDistances(siteId);
       return parkingLotFromRow(rows[0]);
     },
 
@@ -500,12 +587,23 @@ export function createParkingRepository(db) {
       });
     },
 
-    async createStore({ siteId, name }) {
+    async createStore({ siteId, name, navigationUrl = '' }) {
       const result = await db.query(
-        'INSERT INTO parking_stores (site_id, name) VALUES (?, ?)',
-        [siteId, name]
+        'INSERT INTO parking_stores (site_id, name, navigation_url) VALUES (?, ?, ?)',
+        [siteId, name, navigationUrl]
       );
-      return { id: numericId(result.insertId), name };
+      if (navigationUrl) await updateCoordinateDistances(siteId);
+      return { id: numericId(result.insertId), name, navigation_url: navigationUrl };
+    },
+
+    async updateStoreNavigationUrl({ siteId, storeId, navigationUrl }) {
+      const result = await db.query(
+        'UPDATE parking_stores SET navigation_url = ? WHERE id = ? AND site_id = ?',
+        [navigationUrl, storeId, siteId]
+      );
+      if (!result.affectedRows) return false;
+      await updateCoordinateDistances(siteId);
+      return true;
     },
 
     async deleteStore({ siteId, storeId }) {
@@ -533,7 +631,7 @@ export function createParkingRepository(db) {
           seen.add(key);
         }
         for (const entry of entries) {
-          if (entry.minutes === null) {
+          if (entry.minutes === null && entry.km === null) {
             await tx.query(
               'DELETE FROM parking_lot_distances WHERE from_lot_id = ? AND to_lot_id = ? AND site_id = ?',
               [entry.from_lot_id, entry.to_lot_id, siteId]
@@ -541,9 +639,11 @@ export function createParkingRepository(db) {
           } else {
             await tx.query(
               `INSERT INTO parking_lot_distances
-                (site_id, from_lot_id, to_lot_id, minutes, km)
-               VALUES (?, ?, ?, ?, ?)
-               ON DUPLICATE KEY UPDATE minutes = VALUES(minutes), km = VALUES(km)`,
+                (site_id, from_lot_id, to_lot_id, minutes, km, km_auto)
+               VALUES (?, ?, ?, ?, ?, 0)
+               ON DUPLICATE KEY UPDATE minutes = VALUES(minutes),
+                 km = IF(VALUES(km) IS NULL, km, VALUES(km)),
+                 km_auto = IF(VALUES(km) IS NULL, km_auto, 0)`,
               [siteId, entry.from_lot_id, entry.to_lot_id, entry.minutes, entry.km]
             );
           }
@@ -571,7 +671,7 @@ export function createParkingRepository(db) {
           seen.add(key);
         }
         for (const entry of entries) {
-          if (entry.minutes === null) {
+          if (entry.minutes === null && entry.km === null) {
             await tx.query(
               'DELETE FROM parking_store_lot_distances WHERE store_id = ? AND lot_id = ? AND site_id = ?',
               [entry.store_id, entry.lot_id, siteId]
@@ -579,9 +679,11 @@ export function createParkingRepository(db) {
           } else {
             await tx.query(
               `INSERT INTO parking_store_lot_distances
-                (site_id, store_id, lot_id, minutes, km)
-               VALUES (?, ?, ?, ?, ?)
-               ON DUPLICATE KEY UPDATE minutes = VALUES(minutes), km = VALUES(km)`,
+                (site_id, store_id, lot_id, minutes, km, km_auto)
+               VALUES (?, ?, ?, ?, ?, 0)
+               ON DUPLICATE KEY UPDATE minutes = VALUES(minutes),
+                 km = IF(VALUES(km) IS NULL, km, VALUES(km)),
+                 km_auto = IF(VALUES(km) IS NULL, km_auto, 0)`,
               [siteId, entry.store_id, entry.lot_id, entry.minutes, entry.km]
             );
           }
@@ -974,6 +1076,7 @@ export function createParkingRepository(db) {
       const [
         parkingLots,
         vehicleRows,
+        reservationRows,
         statusRows,
         statusAssignments,
         assessmentValues,
@@ -994,9 +1097,19 @@ export function createParkingRepository(db) {
           [siteId]
         ),
         db.query(
-          `SELECT id, external_id, plate, vehicle_type, parking_lot_id,
+          `SELECT id, external_id, erp_vehicle_id, plate, vehicle_type, parking_lot_id,
                   position_x, position_y, unwashed, no_fuel, needs_repair, options, notes
              FROM parking_vehicles WHERE site_id = ? ORDER BY plate, id`,
+          [siteId]
+        ),
+        db.query(
+          `SELECT vehicle_id,
+                  IF(SUM(status = 'checked_in') > 0, 'checked_in', 'reserved') AS status,
+                  MIN(start_at) AS start_at, COUNT(*) AS reservation_count
+             FROM reservations
+            WHERE site_id = ? AND status IN ('reserved', 'checked_in')
+              AND end_at > UTC_TIMESTAMP(3)
+            GROUP BY vehicle_id ORDER BY start_at, vehicle_id`,
           [siteId]
         ),
         db.query(
@@ -1055,16 +1168,16 @@ export function createParkingRepository(db) {
           [siteId]
         ),
         db.query(
-          `SELECT id, name FROM parking_stores WHERE site_id = ? ORDER BY id`,
+          `SELECT id, name, navigation_url FROM parking_stores WHERE site_id = ? ORDER BY id`,
           [siteId]
         ),
         db.query(
-          `SELECT from_lot_id, to_lot_id, minutes, km
+          `SELECT from_lot_id, to_lot_id, minutes, km, km_auto
              FROM parking_lot_distances WHERE site_id = ? ORDER BY from_lot_id, to_lot_id`,
           [siteId]
         ),
         db.query(
-          `SELECT store_id, lot_id, minutes, km
+          `SELECT store_id, lot_id, minutes, km, km_auto
              FROM parking_store_lot_distances WHERE site_id = ? ORDER BY store_id, lot_id`,
           [siteId]
         )
@@ -1089,8 +1202,18 @@ export function createParkingRepository(db) {
         marks.push({ ...data, id: String(data.id), damage_type_id: numericId(data.damage_type_id) });
         marksByVehicle.set(mark.vehicle_id, marks);
       }
+      const reservationsByVehicle = new Map(reservationRows.map((row) => [
+        String(row.vehicle_id), {
+          status: row.status,
+          start_at: row.start_at,
+          reservation_count: Number(row.reservation_count)
+        }
+      ]));
 
       const vehicles = vehicleRows.map((row) => {
+        const reservation = row.erp_vehicle_id
+          ? reservationsByVehicle.get(String(row.erp_vehicle_id)) ?? null
+          : null;
         const vehicle = {
           ...row,
           id: numericId(row.id),
@@ -1103,7 +1226,8 @@ export function createParkingRepository(db) {
           needs_repair: Boolean(row.needs_repair),
           status_ids: assignmentsByVehicle.get(row.id) || [],
           assessment_values: valuesByVehicle.get(row.id) || {},
-          inspection_marks: marksByVehicle.get(row.id) || []
+          inspection_marks: marksByVehicle.get(row.id) || [],
+          reservation
         };
         return vehicle;
       });
@@ -1136,15 +1260,17 @@ export function createParkingRepository(db) {
           ...row,
           from_lot_id: numericId(row.from_lot_id),
           to_lot_id: numericId(row.to_lot_id),
-          minutes: Number(row.minutes),
-          km: row.km === null ? null : Number(row.km)
+          minutes: row.minutes === null ? null : Number(row.minutes),
+          km: row.km === null ? null : Number(row.km),
+          km_auto: Boolean(row.km_auto)
         })),
         store_lot_distances: storeLotDistances.map((row) => ({
           ...row,
           store_id: numericId(row.store_id),
           lot_id: numericId(row.lot_id),
-          minutes: Number(row.minutes),
-          km: row.km === null ? null : Number(row.km)
+          minutes: row.minutes === null ? null : Number(row.minutes),
+          km: row.km === null ? null : Number(row.km),
+          km_auto: Boolean(row.km_auto)
         })),
         vehicle_options: vehicleOptions.map((option) => ({
           ...option,

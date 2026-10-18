@@ -1,10 +1,10 @@
 export function createAdminRepository(db) {
   return {
-    async createSite({ code, name, type }) {
+    async createSite({ code, name, type, address = null, phone = null }) {
       return db.transaction(async (tx) => {
         const rows = await tx.query(
-          'INSERT INTO sites (code, name, type) VALUES (?, ?, ?)',
-          [code, name, type]
+          'INSERT INTO sites (code, name, type, address, phone) VALUES (?, ?, ?, ?, ?)',
+          [code, name, type, address, phone]
         );
         const vehicleClasses = [
           ['A-1', '#4f86f7'], ['A-2', '#9b6ad8'], ['A-2P', '#f0a043'],
@@ -110,7 +110,10 @@ export function createAdminRepository(db) {
     async listSites(siteId) {
       if (siteId) {
         return db.query(
-          `SELECT s.id, s.code, s.name, s.type, s.status,
+          `SELECT s.id, s.code, s.name, s.type, s.status, s.address, s.phone, s.created_at,
+                  (SELECT COUNT(*) FROM vehicles v
+                    WHERE v.site_id = s.id AND v.status <> 'retired') AS vehicle_count,
+                  (SELECT COUNT(*) FROM accounts a WHERE a.site_id = s.id) AS account_count,
                   EXISTS(SELECT 1 FROM accounts a WHERE a.site_id = s.id AND a.status = 'active')
                     AS has_active_account
              FROM sites s WHERE s.id = ? ORDER BY s.id`,
@@ -118,11 +121,51 @@ export function createAdminRepository(db) {
         );
       }
       return db.query(
-        `SELECT s.id, s.code, s.name, s.type, s.status,
+        `SELECT s.id, s.code, s.name, s.type, s.status, s.address, s.phone, s.created_at,
+                (SELECT COUNT(*) FROM vehicles v
+                  WHERE v.site_id = s.id AND v.status <> 'retired') AS vehicle_count,
+                (SELECT COUNT(*) FROM accounts a WHERE a.site_id = s.id) AS account_count,
                 EXISTS(SELECT 1 FROM accounts a WHERE a.site_id = s.id AND a.status = 'active')
                   AS has_active_account
            FROM sites s ORDER BY s.id`
       );
+    },
+
+    async listSiteVehicleCounts(siteId) {
+      const [statuses, classes] = await Promise.all([
+        db.query(
+          `SELECT status, COUNT(*) AS count
+             FROM vehicles WHERE site_id = ? GROUP BY status ORDER BY status`,
+          [siteId]
+        ),
+        db.query(
+          `SELECT pv.vehicle_type AS name, COUNT(*) AS count
+             FROM parking_vehicles pv
+             JOIN vehicles v ON v.id = pv.erp_vehicle_id
+              AND v.site_id = pv.site_id AND v.status <> 'retired'
+            WHERE pv.site_id = ?
+            GROUP BY pv.vehicle_type ORDER BY pv.vehicle_type`,
+          [siteId]
+        )
+      ]);
+      return { statuses, classes };
+    },
+
+    async updateSiteStatus(id, status) {
+      const existing = await db.query(
+        "SELECT id FROM sites WHERE id = ? AND type <> 'headquarters' LIMIT 1",
+        [id]
+      );
+      if (!existing.length) return null;
+      await db.query('UPDATE sites SET status = ? WHERE id = ?', [status, id]);
+      return { id, status };
+    },
+
+    async updateSiteContact(id, { address, phone }) {
+      const existing = await db.query('SELECT id FROM sites WHERE id = ? LIMIT 1', [id]);
+      if (!existing.length) return null;
+      await db.query('UPDATE sites SET address = ?, phone = ? WHERE id = ?', [address, phone, id]);
+      return { id, address, phone };
     },
 
     async listAccounts({ siteId, search, limit, offset }) {

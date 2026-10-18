@@ -17,6 +17,7 @@ import { createCustomerRepository } from './repositories/customer-repository.js'
 import { createEmployeeRepository } from './repositories/employee-repository.js';
 import { createParkingRepository } from './repositories/parking-repository.js';
 import { createParkingRealtime } from './parking-realtime.js';
+import { createParkingSyncService } from './services/parking-sync-service.js';
 import { createAuthService } from './services/auth-service.js';
 import { registerRoutes } from './routes.js';
 import { createErrorLogger } from './error-logger.js';
@@ -135,12 +136,16 @@ export async function buildApp({ config = getConfig(), pool, logger = true, erro
   const admin = createAdminRepository(db);
   const parkingBoard = createParkingRepository(db);
   const vehicles = createVehicleRepository(db, parkingBoard);
+  const parkingSync = createParkingSyncService({
+    vehicles, parkingBoard, parkingRealtime, errorLogger: errors
+  });
   const reservations = createReservationRepository(db);
   const customers = createCustomerRepository(db);
   const employees = createEmployeeRepository(db);
   const auth = createAuthService({ accounts, sessions: authSessions, jwt: app.jwt, config });
   registerRoutes(app, {
-    accounts, admin, vehicles, reservations, customers, employees, auth, parkingBoard, parkingRealtime
+    accounts, admin, vehicles, reservations, customers, employees, auth, parkingBoard, parkingRealtime,
+    parkingSync
   }, errors, () => mysqlPool.execute('SELECT 1'));
 
   app.setErrorHandler((error, request, reply) => {
@@ -175,7 +180,11 @@ export async function buildApp({ config = getConfig(), pool, logger = true, erro
     return reply.code(500).send({ error: 'internal_error' });
   });
 
-  app.addHook('onClose', async () => db.close());
+  app.addHook('onClose', async () => {
+    await parkingSync.close();
+    await db.close();
+  });
+  app.decorate('parkingSync', parkingSync);
   return app;
 }
 
@@ -183,4 +192,5 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === resolve(process.argv[1
   const config = getConfig();
   const app = await buildApp({ config });
   await app.listen({ host: config.host, port: config.port });
+  app.parkingSync.start();
 }

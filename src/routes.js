@@ -123,7 +123,7 @@ function requireEmployeeManager(accounts) {
 }
 
 export function registerRoutes(app, { accounts, admin, vehicles, reservations, customers, employees, auth,
-  parkingBoard, parkingRealtime }, errorLogger, databaseHealth) {
+  parkingBoard, parkingRealtime, parkingSync }, errorLogger, databaseHealth) {
   app.get('/health', async (_request, reply) => {
     try {
       if (databaseHealth) await databaseHealth();
@@ -491,15 +491,50 @@ export function registerRoutes(app, { accounts, admin, vehicles, reservations, c
     schema: {
       body: {
         type: 'object', additionalProperties: false, required: ['name'],
-        properties: { name: { type: 'string', minLength: 1, maxLength: 120 } }
+        properties: {
+          name: { type: 'string', minLength: 1, maxLength: 120 },
+          navigation_url: { type: 'string', maxLength: 2000 }
+        }
       }
     }
   }, async (request, reply) => {
     const name = request.body.name.trim();
-    if (!name) return reply.code(422).send({ error: 'invalid_request' });
-    const store = await parkingBoard.createStore({ siteId: request.user.siteId, name });
+    const navigationUrl = (request.body.navigation_url ?? '').trim();
+    if (!name || navigationUrl && !isGoogleMapsUrl(navigationUrl)) {
+      return reply.code(422).send({ error: 'invalid_request' });
+    }
+    const store = await parkingBoard.createStore({
+      siteId: request.user.siteId, name, navigationUrl
+    });
     parkingRealtime.publish(request.user.siteId);
     return reply.code(201).send(store);
+  });
+
+  app.patch('/api/v1/parking/stores/:id', {
+    preHandler: requirePermissions(['parking:read', 'parking:admin']),
+    schema: {
+      params: {
+        type: 'object', required: ['id'],
+        properties: { id: { type: 'string', pattern: '^[1-9][0-9]*$' } }
+      },
+      body: {
+        type: 'object', additionalProperties: false, required: ['navigation_url'],
+        properties: { navigation_url: { type: 'string', maxLength: 2000 } }
+      }
+    }
+  }, async (request, reply) => {
+    const navigationUrl = request.body.navigation_url.trim();
+    if (navigationUrl && !isGoogleMapsUrl(navigationUrl)) {
+      return reply.code(422).send({ error: 'invalid_request' });
+    }
+    const updated = await parkingBoard.updateStoreNavigationUrl({
+      siteId: request.user.siteId,
+      storeId: request.params.id,
+      navigationUrl
+    });
+    if (!updated) return reply.code(404).send({ error: 'not_found' });
+    parkingRealtime.publish(request.user.siteId);
+    return reply.code(204).send();
   });
 
   app.delete('/api/v1/parking/stores/:id', {
@@ -1008,6 +1043,24 @@ export function registerRoutes(app, { accounts, admin, vehicles, reservations, c
     return reply.header('Cache-Control', 'no-store').send(publicSession);
   });
 
+  app.post('/api/v1/auth/switch-account', {
+    preHandler: requireOwnerAdmin(accounts),
+    schema: {
+      body: {
+        type: 'object', additionalProperties: false, required: ['accountId'],
+        properties: { accountId: { type: 'string', pattern: '^[1-9]\\d*$' } }
+      }
+    }
+  }, async (request, reply) => {
+    const session = await auth.switchToAccount(request.body.accountId);
+    if (!session) return reply.code(404).send({ error: 'account_unavailable' });
+    await auth.revoke(getCookie(request, refreshCookieNames.site));
+    setRefreshCookie(reply, request, refreshCookieNames.site,
+      session.refreshToken, auth.refreshExpiresIn);
+    const { refreshToken: _refreshToken, ...publicSession } = session;
+    return reply.header('Cache-Control', 'no-store').send(publicSession);
+  });
+
   app.get('/api/v1/auth/me', {
     preHandler: async (request) => request.jwtVerify()
   }, async (request, reply) => {
@@ -1042,15 +1095,99 @@ export function registerRoutes(app, { accounts, admin, vehicles, reservations, c
     return { items: items.map(({ has_active_account: _hasActiveAccount, ...site }) => site) };
   });
 
-  app.post('/api/v1/sites', {
-    preHandler: requirePermission('sites:write', { headquartersOnly: true })
+  app.get('/api/v1/sites/:id', {
+    preHandler: requirePermission('sites:read'),
+    schema: {
+      params: {
+        type: 'object',
+        required: ['id'],
+        properties: { id: { type: 'string', pattern: '^[1-9]\\d*$' } }
+      }
+    }
   }, async (request, reply) => {
-    const { code, name, type } = request.body || {};
+    const siteId = request.params.id;
+    if (request.user.siteType !== 'headquarters' && String(request.user.siteId) !== siteId) {
+      return reply.code(404).send({ error: 'not_found' });
+    }
+    const [site] = await admin.listSites(siteId);
+    if (!site) return reply.code(404).send({ error: 'not_found' });
+    const account = await accounts.findById(request.user.sub);
+    const {
+      has_active_account: _hasActiveAccount, account_count: _accountCount, ...siteWithoutAdminData
+    } = site;
+    const publicSite = Number(account?.is_owner_admin) === 1 ? site : siteWithoutAdminData;
+    return { ...publicSite, vehicle_counts: await admin.listSiteVehicleCounts(siteId) };
+  });
+
+  app.post('/api/v1/sites', {
+    preHandler: requirePermission('sites:write', { headquartersOnly: true }),
+    schema: {
+      body: {
+        type: 'object', additionalProperties: false, required: ['code', 'name', 'type'],
+        properties: {
+          code: { type: 'string', minLength: 1, maxLength: 32 },
+          name: { type: 'string', minLength: 1, maxLength: 120 },
+          type: { type: 'string', enum: ['direct', 'franchise'] },
+          address: { type: 'string', maxLength: 500 },
+          phone: { type: 'string', maxLength: 32 }
+        }
+      }
+    }
+  }, async (request, reply) => {
+    const { code, name, type, address = '', phone = '' } = request.body || {};
     if (!isText(code, 1, 32) || !isText(name, 1, 120) || !siteTypes.has(type)) {
       return reply.code(400).send({ error: 'invalid_site' });
     }
-    const site = await admin.createSite({ code: code.trim(), name: name.trim(), type });
+    const site = await admin.createSite({
+      code: code.trim(), name: name.trim(), type,
+      address: address.trim() || null,
+      phone: phone.trim() || null
+    });
     return reply.code(201).send(site);
+  });
+
+  app.patch('/api/v1/sites/:id', {
+    preHandler: requireOwnerAdmin(accounts),
+    schema: {
+      params: {
+        type: 'object',
+        required: ['id'],
+        properties: { id: { type: 'string', pattern: '^[1-9]\\d*$' } }
+      },
+      body: {
+        type: 'object', additionalProperties: false, required: ['status'],
+        properties: { status: { type: 'string', enum: ['active', 'inactive'] } }
+      }
+    }
+  }, async (request, reply) => {
+    const site = await admin.updateSiteStatus(request.params.id, request.body.status);
+    if (!site) return reply.code(404).send({ error: 'not_found' });
+    return site;
+  });
+
+  app.patch('/api/v1/sites/:id/contact', {
+    preHandler: requireOwnerAdmin(accounts),
+    schema: {
+      params: {
+        type: 'object',
+        required: ['id'],
+        properties: { id: { type: 'string', pattern: '^[1-9]\\d*$' } }
+      },
+      body: {
+        type: 'object', additionalProperties: false, required: ['address', 'phone'],
+        properties: {
+          address: { type: 'string', maxLength: 500 },
+          phone: { type: 'string', maxLength: 32 }
+        }
+      }
+    }
+  }, async (request, reply) => {
+    const site = await admin.updateSiteContact(request.params.id, {
+      address: request.body.address.trim() || null,
+      phone: request.body.phone.trim() || null
+    });
+    if (!site) return reply.code(404).send({ error: 'not_found' });
+    return site;
   });
 
   app.get('/api/v1/permissions', {
@@ -1425,6 +1562,7 @@ export function registerRoutes(app, { accounts, admin, vehicles, reservations, c
       }
       throw error;
     }
+    parkingSync?.markDirty(siteId);
     if (hasParkingFields) parkingRealtime.publish(siteId);
     return reply.code(201).send(vehicle);
   });
@@ -1468,6 +1606,7 @@ export function registerRoutes(app, { accounts, admin, vehicles, reservations, c
     const siteScope = request.user.siteType === 'headquarters' ? undefined : request.user.siteId;
     const vehicle = await vehicles.update(request.params.id, fields, siteScope);
     if (!vehicle) return reply.code(404).send({ error: 'vehicle_not_found' });
+    parkingSync?.markDirty(vehicle.site_id);
     return vehicle;
   });
 
@@ -1663,6 +1802,7 @@ export function registerRoutes(app, { accounts, admin, vehicles, reservations, c
         endAt: asMysqlDateTime(end),
         createdBy: request.user.sub
       });
+      parkingSync?.markDirty(siteId);
       return reply.code(201).send(reservation);
     } catch (error) {
       if (error.code === 'ERP_CONFLICT') return reply.code(409).send({ error: 'reservation_conflict' });
@@ -1697,6 +1837,8 @@ export function registerRoutes(app, { accounts, admin, vehicles, reservations, c
       siteId: request.user.siteType === 'headquarters' ? undefined : request.user.siteId
     });
     if (!result) return reply.code(404).send({ error: 'reservation_not_found' });
+    parkingSync?.markDirty(result.syncSiteId || request.user.siteId);
+    delete result.syncSiteId;
     return result;
   });
 }
