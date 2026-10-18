@@ -16,7 +16,8 @@ async function makeApp(user) {
     updatedVehicle: null, createdReservation: null, transitionedReservation: null, dashboardSiteScope: null,
     customerList: null, createdCustomer: null, updatedCustomer: null,
     reservationCatalogSiteScope: null, availableVehicleQuery: null,
-    createdAccount: null, employeeList: null, createdEmployee: null, updatedEmployee: null,
+    createdAccount: null, updatedAccount: null, accountListFilters: [],
+    employeeList: null, createdEmployee: null, updatedEmployee: null,
     parkingSyncVehicles: null, parkingSyncResult: { created: 1, updated: 0, synced: 1 },
     parkingSyncError: null,
     parkingBootstrapSiteScope: null, parkingVehicleCatalogSiteScope: null, parkingUpdate: null,
@@ -51,12 +52,19 @@ async function makeApp(user) {
       listSites: async (siteId) => siteId
         ? [{ id: siteId, code: 'SHOP', name: 'Shop', type: 'direct', status: 'active' }]
         : [],
-      listAccounts: async () => [],
+      listAccounts: async (filters) => {
+        calls.accountListFilters.push(filters);
+        return user.listedAccounts ?? [];
+      },
       listRoles: async () => [],
       listPermissions: async () => [{ permission_key: 'reservations:read', description: 'Read reservations' }],
       createAccount: async (account) => {
         calls.createdAccount = account;
         return { id: '99', ...account };
+      },
+      updateAccount: async (id, fields, siteScope) => {
+        calls.updatedAccount = { id, fields, siteScope };
+        return { id };
       },
       dashboardStats: async (siteId) => {
         calls.dashboardSiteScope = siteId;
@@ -639,13 +647,18 @@ test('only the owner-admin can manage store login accounts and permissions', asy
     profile: {
       id: '1', is_owner_admin: 1, status: 'active', site_status: 'active',
       site_id: '1', site_type: 'headquarters'
-    }
+    },
+    listedAccounts: [{
+      id: '1', username: 'admin', is_owner_admin: 1, site_name: 'Headquarters'
+    }]
   });
   t.after(() => app.close());
 
   const headers = { authorization: ['Bearer', token].join(' ') };
   const list = await app.inject({ method: 'GET', url: '/api/v1/accounts', headers });
   assert.equal(list.statusCode, 200);
+  assert.equal(list.json().items[0].is_owner_admin, 1);
+  assert.equal(calls.accountListFilters[0].siteId, undefined);
   const create = await app.inject({
     method: 'POST', url: '/api/v1/accounts', headers,
     payload: {
@@ -661,6 +674,55 @@ test('only the owner-admin can manage store login accounts and permissions', asy
     method: 'GET', url: '/api/v1/permissions', headers
   });
   assert.equal(permissions.statusCode, 200);
+
+  const resetPassword = await app.inject({
+    method: 'PATCH', url: '/api/v1/accounts/1/password', headers,
+    payload: { password: 'new secure password 2026' }
+  });
+  assert.equal(resetPassword.statusCode, 200);
+  assert.equal(calls.updatedAccount.id, '1');
+  assert.match(calls.updatedAccount.fields.passwordHash, /^\$2[aby]\$/);
+  assert.equal(calls.updatedAccount.siteScope, undefined);
+});
+
+test('only owner admin can reset passwords, and reset endpoint never changes other account fields', async (t) => {
+  const regular = await makeApp({
+    sub: '14', siteId: '2', siteType: 'direct', permissions: [],
+    profile: {
+      id: '14', is_owner_admin: 0, status: 'active', site_status: 'active',
+      site_id: '2', site_type: 'direct'
+    }
+  });
+  t.after(() => regular.app.close());
+  const denied = await regular.app.inject({
+    method: 'PATCH', url: '/api/v1/accounts/1/password',
+    headers: { authorization: `Bearer ${regular.token}` },
+    payload: { password: 'new secure password 2026' }
+  });
+  assert.equal(denied.statusCode, 403);
+
+  const owner = await makeApp({
+    sub: '1', siteId: '1', siteType: 'headquarters', permissions: [],
+    profile: {
+      id: '1', is_owner_admin: 1, status: 'active', site_status: 'active',
+      site_id: '1', site_type: 'headquarters'
+    }
+  });
+  t.after(() => owner.app.close());
+  const tooShort = await owner.app.inject({
+    method: 'PATCH', url: '/api/v1/accounts/1/password',
+    headers: { authorization: `Bearer ${owner.token}` },
+    payload: { password: 'short' }
+  });
+  const extraProperty = await owner.app.inject({
+    method: 'PATCH', url: '/api/v1/accounts/1/password',
+    headers: { authorization: `Bearer ${owner.token}` },
+    payload: { password: 'new secure password 2026', status: 'disabled' }
+  });
+  assert.equal(tooShort.statusCode, 400);
+  assert.equal(extraProperty.statusCode, 200);
+  assert.equal(owner.calls.updatedAccount.fields.status, undefined);
+  assert.ok(owner.calls.updatedAccount.fields.passwordHash);
 });
 
 test('store accounts manage employee names only within their own site', async (t) => {
