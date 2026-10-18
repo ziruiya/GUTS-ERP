@@ -1188,6 +1188,32 @@ export function registerRoutes(app, { accounts, admin, vehicles, reservations, c
     return { id: String(result.id), status: 'updated' };
   });
 
+  app.patch('/api/v1/accounts/:id/password', {
+    preHandler: requireOwnerAdmin(accounts),
+    schema: {
+      params: {
+        type: 'object',
+        required: ['id'],
+        properties: { id: { type: 'string', pattern: '^[1-9]\\d*$' } }
+      },
+      body: {
+        type: 'object',
+        required: ['password'],
+        additionalProperties: false,
+        properties: { password: { type: 'string', minLength: 12, maxLength: 128 } }
+      }
+    }
+  }, async (request, reply) => {
+    const passwordHash = await bcrypt.hash(request.body.password, 12);
+    const result = await admin.updateAccount(
+      request.params.id,
+      { passwordHash },
+      request.user.siteType === 'headquarters' ? undefined : request.user.siteId
+    );
+    if (!result) return reply.code(404).send({ error: 'account_not_found' });
+    return { id: String(result.id), status: 'password_updated' };
+  });
+
   app.get('/api/v1/employees', {
     preHandler: requireEmployeeManager(accounts),
     schema: {

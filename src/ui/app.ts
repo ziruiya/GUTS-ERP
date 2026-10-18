@@ -13,6 +13,7 @@ type Site = {
 type Account = {
   id: string; site_id: string; username: string; display_name: string; status: string;
   site_code: string; site_name: string; role_ids: unknown; permissions: unknown;
+  is_owner_admin: boolean | number;
 };
 type Employee = { id: string; site_id: string; name: string; status: string };
 type Vehicle = {
@@ -201,6 +202,7 @@ const humanError = (code: string) => ({
   in_use: '車両または作業予定が残っているため、この駐車エリアは削除できません。',
   last_lot: '最後の駐車エリアは削除できません。',
   reservation_conflict: '車両または予約の状態が変更されています。画面を更新して再度お試しください。',
+  password_mismatch: '新しいパスワードが一致しないか、必要な文字数を満たしていません。',
   invalid_reference: '選択した店舗、車両、スタッフ、または駐車場設定をご確認ください。',
   invalid_request: '入力内容をご確認ください。',
   internal_error: 'システムエラーが発生しました。しばらくしてから再度お試しください。',
@@ -682,14 +684,14 @@ async function renderAccounts() {
   const result = await api<{ items: Account[] }>(`/api/v1/accounts?${params}`);
   currentAccounts = result.items;
   const rows = result.items.map((item) => `<tr>
-    <td class="primary-cell" data-label="店舗アカウント">${text(item.site_name)}<span class="secondary">${text(item.username)}</span></td>
+    <td class="primary-cell" data-label="店舗アカウント">${text(item.site_name)}${Number(item.is_owner_admin) === 1 ? '<span class="account-admin-badge">管理者</span>' : ''}<span class="secondary">${text(item.display_name)} · ${text(item.username)}</span></td>
     <td data-label="店舗コード">${text(item.site_code)}</td>
     <td data-label="状態">${badge(item.status)}</td>
-    <td data-label="操作"><button class="btn btn-sm" data-action="edit-account" data-id="${text(item.id)}">編集</button></td>
+    <td data-label="操作"><div class="table-actions">${Number(item.is_owner_admin) === 1 ? '' : `<button class="btn btn-sm" data-action="edit-account" data-id="${text(item.id)}">編集</button>`}<button class="btn btn-sm" data-action="reset-account-password" data-id="${text(item.id)}">パスワード変更</button></div></td>
   </tr>`).join('');
-  setContent(`${pageHead('店舗アカウント', '店舗ごとのログインと利用権限を管理', `<button class="btn btn-primary" data-modal="account">${icon('plus')} 店舗アカウントを追加</button>`)}
+  setContent(`${pageHead('店舗アカウント', 'すべての店舗・管理アカウントとパスワードを管理', `<button class="btn btn-primary" data-modal="account">${icon('plus')} 店舗アカウントを追加</button>`)}
     ${renderToolbar('店舗名、アカウント名で検索')}
-    ${pageTable(['店舗 / アカウント', '店舗コード', '状態', '操作'], rows, '店舗アカウントはありません')}
+    ${pageTable(['店舗 / アカウント', '店舗コード', '状態', '操作'], rows, 'アカウントはありません')}
     ${pagination(result.items.length)}`);
 }
 function siteOptions(selected = '', includeHeadquarters = false) {
@@ -1509,9 +1511,18 @@ async function openModal(which: string, id = '') {
       if (!account) throw new Error('not_found');
       modalTemplate('店舗アカウントを編集', `${text(account.site_name)} · ${text(account.username)}`, `<input type="hidden" name="id" value="${text(account.id)}"><div class="form-grid">
         ${selectField('status', 'アカウントの状態', `<option value="active" ${account.status === 'active' ? 'selected' : ''}>有効</option><option value="disabled" ${account.status === 'disabled' ? 'selected' : ''}>無効</option>`)}
-        ${field('password', 'パスワードを再設定（任意）', 'password', '', '空欄の場合は変更しません')}
         <div class="field full"><span class="field-label">利用権限</span>${permissionChecks(jsonArray(account.permissions))}</div>
       </div>`, 'edit-account');
+    } else if (which === 'reset-account-password') {
+      const account = currentAccounts.find((item) => item.id === id);
+      if (!account) throw new Error('not_found');
+      modalTemplate('パスワードを変更', `${text(account.site_name)} · ${text(account.username)}`, `
+        <input type="hidden" name="id" value="${text(account.id)}">
+        <div class="form-grid">
+          <label class="field"><span class="field-label">新しいパスワード</span><input name="password" type="password" autocomplete="new-password" minlength="12" maxlength="128" placeholder="12～128 文字" required></label>
+          <label class="field"><span class="field-label">新しいパスワード（確認）</span><input name="confirmPassword" type="password" autocomplete="new-password" minlength="12" maxlength="128" placeholder="もう一度入力してください" required></label>
+          <p class="section-note field full">変更前にログイン済みの端末は、そのままログイン状態が続きます。</p>
+        </div>`, 'reset-account-password', 'パスワードを変更');
     } else if (which === 'customer' || which === 'edit-customer') {
       const customer = which === 'edit-customer'
         ? currentCustomers.find((item) => item.id === id)
@@ -1963,8 +1974,16 @@ async function handleSubmit(event: Event) {
         status: value('status'),
         permissions: checkedValues(form, 'permissions')
       };
-      if (value('password')) payload.password = value('password');
       await api(`/api/v1/accounts/${encodeURIComponent(value('id'))}`, { method: 'PATCH', body: JSON.stringify(payload) });
+    } else if (kind === 'reset-account-password') {
+      const password = String(data.get('password') ?? '');
+      const confirmPassword = String(data.get('confirmPassword') ?? '');
+      if (password.length < 12 || password.length > 128 || password !== confirmPassword) {
+        throw new Error('password_mismatch');
+      }
+      await api(`/api/v1/accounts/${encodeURIComponent(value('id'))}/password`, {
+        method: 'PATCH', body: JSON.stringify({ password })
+      });
     } else if (kind === 'employee') {
       await api('/api/v1/employees', {
         method: 'POST', body: JSON.stringify({ siteId: value('siteId'), name: value('name') })
@@ -2398,6 +2417,8 @@ async function handleClick(event: MouseEvent) {
   } else if (target.dataset.action === 'employee-edit') {
     closeModal();
     await openModal('employee-edit', target.dataset.id!);
+  } else if (target.dataset.action === 'reset-account-password') {
+    await openModal('reset-account-password', target.dataset.id!);
   } else if (target.dataset.action === 'employee-toggle') {
     const siteId = employeeSiteId;
     closeModal();

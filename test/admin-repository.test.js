@@ -40,3 +40,21 @@ test('new headquarters sites receive the GUTS-Parking default vehicle catalogs',
   ]);
   assert.deepEqual(createdDamageTypes.map(([, key]) => key), ['scratch', 'dent']);
 });
+
+test('account list includes owner-admin marker without exposing password hashes', async () => {
+  let call;
+  const repository = createAdminRepository({
+    query: async (sql, params) => {
+      call = { sql, params };
+      return [{
+        id: '1', username: 'admin', is_owner_admin: 1,
+        site_id: '1', site_name: 'Headquarters'
+      }];
+    }
+  });
+  const items = await repository.listAccounts({ search: 'admin', limit: 50, offset: 0 });
+  assert.equal(items[0].is_owner_admin, 1);
+  assert.match(call.sql, /a\.is_owner_admin/);
+  assert.doesNotMatch(call.sql, /password_hash/);
+  assert.deepEqual(call.params, ['%admin%', '%admin%', '%admin%', '%admin%', 50, 0]);
+});

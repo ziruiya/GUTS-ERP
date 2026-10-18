@@ -140,7 +140,7 @@ export function createAdminRepository(db) {
       const where = filters.length ? `WHERE ${filters.join(' AND ')}` : '';
       params.push(limit, offset);
       return db.query(
-        `SELECT a.id, a.site_id, a.username, a.display_name, a.status,
+        `SELECT a.id, a.site_id, a.username, a.display_name, a.status, a.is_owner_admin,
                 s.code AS site_code, s.name AS site_name, a.created_at,
                 (SELECT JSON_ARRAYAGG(CAST(ar.role_id AS CHAR)) FROM account_roles ar
                   WHERE ar.account_id = a.id) AS role_ids,
