@@ -1,5 +1,6 @@
 import bcrypt from 'bcryptjs';
 import { randomUUID } from 'node:crypto';
+import { assessVehicle, tokyoToday } from './services/compliance.js';
 
 const siteTypes = new Set(['headquarters', 'direct', 'franchise']);
 const vehicleStatuses = new Set(['available', 'rented', 'maintenance', 'retired']);
@@ -966,6 +967,27 @@ export function registerRoutes(app, { accounts, admin, vehicles, reservations, c
     request.user.siteType === 'headquarters' ? undefined : request.user.siteId
   ));
 
+  app.get('/api/v1/dashboard/compliance', {
+    preHandler: requirePermission('vehicles:read'),
+    schema: {
+      querystring: {
+        type: 'object',
+        properties: {
+          withinDays: { type: 'integer', minimum: 1, maximum: 365, default: 60 }
+        }
+      }
+    }
+  }, async (request) => {
+    const withinDays = request.query.withinDays ?? 60;
+    const today = tokyoToday();
+    const { items, summary } = await vehicles.listCompliance({
+      siteId: request.user.siteType === 'headquarters' ? undefined : request.user.siteId,
+      today,
+      withinDays
+    });
+    return { today, withinDays, summary, items };
+  });
+
   app.post('/api/v1/auth/login', {
     config: { rateLimit: { max: 10, timeWindow: '1 minute' } },
     schema: {
@@ -1444,7 +1466,8 @@ export function registerRoutes(app, { accounts, admin, vehicles, reservations, c
       }
     }
   }, async (request) => {
-    const items = await vehicles.list({
+    const today = tokyoToday();
+    const items = (await vehicles.list({
       siteId: request.user.siteType === 'headquarters'
         ? request.query.siteId
         : request.user.siteId,
@@ -1452,7 +1475,7 @@ export function registerRoutes(app, { accounts, admin, vehicles, reservations, c
       search: request.query.search?.trim() || undefined,
       limit: request.query.limit ?? 50,
       offset: request.query.offset ?? 0
-    });
+    })).map((item) => ({ ...item, compliance_level: assessVehicle(item, today).level }));
     return { items, limit: request.query.limit ?? 50, offset: request.query.offset ?? 0 };
   });
 

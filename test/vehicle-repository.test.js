@@ -102,6 +102,38 @@ test('vehicle inspection dates are persisted and can be cleared within site scop
   assert.equal(vehicle.statutory_inspection_date, '2026-11-11');
 });
 
+test('compliance list scopes by site, excludes retired vehicles, and sorts by urgency', async () => {
+  const calls = [];
+  const db = {
+    async query(sql, params = []) {
+      calls.push({ sql, params });
+      return [
+        {
+          id: 'v-ok-missing', registration_number: '品川500あ0003', site_id: '42', status: 'available',
+          inspection_expiry_date: '2027-06-01', statutory_inspection_date: null
+        },
+        {
+          id: 'v-overdue', registration_number: '品川500あ0001', site_id: '42', status: 'rented',
+          inspection_expiry_date: '2026-11-01', statutory_inspection_date: '2027-06-01'
+        },
+        {
+          id: 'v-soon', registration_number: '品川500あ0002', site_id: '42', status: 'available',
+          inspection_expiry_date: '2026-12-20', statutory_inspection_date: '2027-06-01'
+        }
+      ];
+    }
+  };
+  const { items, summary } = await createVehicleRepository(db).listCompliance({
+    siteId: '42', today: '2026-11-05', withinDays: 60
+  });
+  assert.match(calls[0].sql, /status <> 'retired'/);
+  assert.match(calls[0].sql, /site_id = \?/);
+  assert.deepEqual(calls[0].params, ['42', '2027-01-04', '2027-01-04']);
+  assert.deepEqual(items.map((item) => item.id), ['v-overdue', 'v-soon', 'v-ok-missing']);
+  assert.deepEqual(items.map((item) => item.compliance.level), ['overdue', 'due_soon', 'missing']);
+  assert.deepEqual(summary, { overdue: 1, dueSoon: 1, missing: 1, total: 3 });
+});
+
 test('unknown parking class aborts before inserting either vehicle row', async () => {
   const statements = [];
   const query = async (sql) => {

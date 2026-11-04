@@ -1,3 +1,5 @@
+import { addDays, assessVehicle, compareCompliance } from '../services/compliance.js';
+
 export function createVehicleRepository(db, parkingBoard) {
   return {
     async findById(id, siteId) {
@@ -38,6 +40,37 @@ export function createVehicleRepository(db, parkingBoard) {
           ORDER BY id LIMIT ? OFFSET ?`,
         [...params, limit, offset]
       );
+    },
+
+    async listCompliance({ siteId, today, withinDays = 60 }) {
+      const cutoff = addDays(today, withinDays);
+      const filters = ["status <> 'retired'"];
+      const params = [];
+      if (siteId) {
+        filters.push('site_id = ?');
+        params.push(siteId);
+      }
+      filters.push('(inspection_expiry_date IS NULL OR statutory_inspection_date IS NULL' +
+        ' OR inspection_expiry_date <= ? OR statutory_inspection_date <= ?)');
+      params.push(cutoff, cutoff);
+      const rows = await db.query(
+        `SELECT id, registration_number, vin, make, model, model_year,
+                inspection_expiry_date, statutory_inspection_date,
+                site_id, status, updated_at
+           FROM vehicles WHERE ${filters.join(' AND ')}
+          ORDER BY id`,
+        params
+      );
+      const items = rows
+        .map((row) => ({ ...row, compliance: assessVehicle(row, today, withinDays) }))
+        .sort(compareCompliance);
+      const summary = { overdue: 0, dueSoon: 0, missing: 0, total: items.length };
+      for (const item of items) {
+        if (item.compliance.level === 'overdue') summary.overdue += 1;
+        else if (item.compliance.level === 'due_soon') summary.dueSoon += 1;
+        else if (item.compliance.level === 'missing') summary.missing += 1;
+      }
+      return { items, summary };
     },
 
     async listForParkingSync(siteId) {
