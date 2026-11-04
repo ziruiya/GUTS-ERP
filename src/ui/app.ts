@@ -22,10 +22,20 @@ type Account = {
   is_owner_admin: boolean | number;
 };
 type Employee = { id: string; site_id: string; name: string; status: string };
+type ComplianceLevel = 'overdue' | 'due_soon' | 'missing' | 'ok';
+type ComplianceDate = { date: string | null; status: string; daysRemaining: number | null };
+type Compliance = { inspection: ComplianceDate; statutory: ComplianceDate; level: ComplianceLevel };
 type Vehicle = {
   id: string; registration_number: string; vin: string | null; make: string; model: string;
   model_year: number | null; inspection_expiry_date: string | null;
   statutory_inspection_date: string | null; site_id: string; status: string;
+  compliance_level?: ComplianceLevel;
+};
+type ComplianceVehicle = Vehicle & { compliance: Compliance };
+type ComplianceData = {
+  today: string; withinDays: number;
+  summary: { overdue: number; dueSoon: number; missing: number; total: number };
+  items: ComplianceVehicle[];
 };
 type ParkingVehicle = {
   id: number; plate: string; vehicle_type: string; parking_lot_id: number | null;
@@ -608,13 +618,32 @@ function statCard(title: string, number: number, foot: string, iconName: string,
   const locale = activeLanguage() === 'zh' ? 'zh-CN' : 'ja-JP';
   return `<article class="stat-card"><div class="stat-top">${title}<span class="stat-icon ${tone}">${icon(iconName)}</span></div><div class="stat-number">${number.toLocaleString(locale)}</div><div class="stat-foot">${foot}</div></article>`;
 }
+function complianceBadge(level?: ComplianceLevel | string) {
+  if (level === 'overdue') return '<span class="badge badge-red">期限切れ</span>';
+  if (level === 'due_soon') return '<span class="badge badge-orange">期限間近</span>';
+  if (level === 'missing') return '<span class="badge badge-gray">日付未登録</span>';
+  return '';
+}
+function complianceDateText(name: string, entry: ComplianceDate) {
+  if (!entry.date) return `${name} 未登録`;
+  if (entry.status === 'overdue') return `${name} ${entry.date}・${Math.abs(entry.daysRemaining ?? 0)}日超過`;
+  return `${name} ${entry.date}・残り${entry.daysRemaining}日`;
+}
+function compliancePanel(compliance: ComplianceData, sites: Site[]) {
+  const siteName = (item: ComplianceVehicle) =>
+    sites.find((site) => site.id === item.site_id)?.name ?? item.site_id;
+  return `<section class="panel"><div class="panel-head"><h2>車検・点検 期限アラート</h2><small>期限切れ ${compliance.summary.overdue} 件 ・ 60日以内 ${compliance.summary.dueSoon} 件 ・ 未登録 ${compliance.summary.missing} 件</small></div>
+    ${compliance.items.length ? `<div class="site-list">${compliance.items.slice(0, 6).map((item) => `<div class="site-line"><div><div class="site-name">${text(item.registration_number)} <span class="secondary">${text(siteName(item))}</span></div><div class="site-meta">${text(complianceDateText('車検', item.compliance.inspection))} ・ ${text(complianceDateText('法定点検', item.compliance.statutory))}</div></div>${complianceBadge(item.compliance.level)}</div>`).join('')}</div>` : `<div class="empty">期限が近い車両はありません</div>`}
+  </section>`;
+}
 async function renderDashboard() {
   const reservationParams = new URLSearchParams({ limit: '6' });
   if (profile!.site.type === 'headquarters') reservationParams.set('siteId', profile!.site.id);
-  const [stats, sitesData, reservationsData] = await Promise.all([
+  const [stats, sitesData, reservationsData, complianceData] = await Promise.all([
     api<Stats>('/api/v1/dashboard/stats'),
     can('sites:read') ? api<{ items: Site[] }>('/api/v1/sites') : Promise.resolve({ items: [] as Site[] }),
-    can('reservations:read') ? api<{ items: Reservation[] }>(`/api/v1/reservations?${reservationParams}`) : Promise.resolve({ items: [] as Reservation[] })
+    can('reservations:read') ? api<{ items: Reservation[] }>(`/api/v1/reservations?${reservationParams}`) : Promise.resolve({ items: [] as Reservation[] }),
+    can('vehicles:read') ? api<ComplianceData>('/api/v1/dashboard/compliance').catch(() => null) : Promise.resolve(null)
   ]);
   cachedSites = sitesData.items;
   const upcoming = reservationsData.items.slice(0, 5);
@@ -637,6 +666,7 @@ async function renderDashboard() {
         ${cachedSites.length > 6 ? `<button class="btn btn-sm" data-page="sites">すべての店舗を表示 ${icon('arrow')}</button>` : ''}
       </section>
       ${can('reservations:read') ? `<section class="panel"><div class="panel-head"><h2>車両状況</h2><small>リアルタイム集計</small></div>${fleetBreakdown(stats)}</section>` : ''}
+      ${complianceData ? compliancePanel(complianceData, cachedSites) : ''}
     </div>`);
 }
 function fleetBreakdown(stats: Stats) {
@@ -786,7 +816,7 @@ async function renderVehicles() {
     <td class="primary-cell" data-label="車両">${text(item.registration_number)}${item.make || item.model || item.model_year ? `<span class="secondary">${text(item.make)} ${text(item.model)} ${item.model_year ? `・${item.model_year}` : ''}</span>` : ''}${item.inspection_expiry_date || item.statutory_inspection_date ? `<span class="secondary vehicle-date-summary">${item.inspection_expiry_date ? `車検 ${text(dateInputValue(item.inspection_expiry_date))}` : ''}${item.inspection_expiry_date && item.statutory_inspection_date ? ' · ' : ''}${item.statutory_inspection_date ? `法定点検 ${text(dateInputValue(item.statutory_inspection_date))}` : ''}</span>` : ''}</td>
     <td data-label="店舗">${text(cachedSites.find((site) => site.id === item.site_id)?.name ??
       (profile!.site.id === item.site_id ? profile!.site.name : item.site_id))}</td>
-    <td data-label="状態">${badge(item.status)}</td>
+    <td data-label="状態">${badge(item.status)}${complianceBadge(item.compliance_level)}</td>
     <td data-label="操作">${can('vehicles:write') ? `<button class="btn btn-sm" data-action="edit-vehicle" data-id="${text(item.id)}">編集</button>` : ''}</td>
   </tr>`).join('');
   const filter = `<select class="filter-select" data-status><option value="">すべての状態</option>${['available','rented','maintenance','retired'].map((status) => `<option value="${status}" ${statusFilter === status ? 'selected' : ''}>${label(status)}</option>`).join('')}</select>`;

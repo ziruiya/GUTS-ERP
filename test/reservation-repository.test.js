@@ -9,7 +9,7 @@ test('reservation creation locks and validates the reserved vehicle and prevents
       query: async (sql, params) => {
         statements.push({ sql, params });
         if (sql.startsWith('INSERT INTO customers')) return { insertId: 72 };
-        if (sql.startsWith('SELECT id, site_id, status FROM vehicles')) {
+        if (sql.startsWith('SELECT id, site_id, status, inspection_expiry_date FROM vehicles')) {
           return [{ id: 'vehicle-1', site_id: '4', status: 'available' }];
         }
         if (sql.startsWith('SELECT id FROM reservations')) return [];
@@ -34,7 +34,7 @@ test('reservation creation locks and validates the reserved vehicle and prevents
   assert.equal(result.customerId, '72');
   assert.match(result.reservationCode, /^[A-F0-9]{12}$/);
   assert.ok(statements.some(({ sql }) => sql.startsWith('INSERT INTO customers')));
-  assert.ok(statements.some(({ sql }) => sql.startsWith('SELECT id, site_id, status FROM vehicles') && sql.endsWith('FOR UPDATE')));
+  assert.ok(statements.some(({ sql }) => sql.startsWith('SELECT id, site_id, status, inspection_expiry_date FROM vehicles') && sql.endsWith('FOR UPDATE')));
   assert.ok(statements.some(({ sql }) => sql.includes("status IN ('reserved', 'checked_in')")));
 });
 
@@ -66,7 +66,7 @@ test('reservation can use an existing same-site customer without creating a dupl
         if (sql.startsWith('SELECT id, name, phone FROM customers')) {
           return [{ id: '71', name: 'Stored Name', phone: '09012345678' }];
         }
-        if (sql.startsWith('SELECT id, site_id, status FROM vehicles')) {
+        if (sql.startsWith('SELECT id, site_id, status, inspection_expiry_date FROM vehicles')) {
           return [{ id: 'vehicle-1', site_id: '4', status: 'available' }];
         }
         if (sql.startsWith('SELECT id FROM reservations')) return [];
@@ -122,10 +122,65 @@ test('available vehicle search filters the selected site, interval, class, and e
   });
   assert.match(calls[0].sql, /v\.site_id = \? AND v\.status = 'available' AND c\.name = \?/);
   assert.match(calls[0].sql, /r\.start_at < \? AND r\.end_at > \?/);
+  assert.match(calls[0].sql, /v\.inspection_expiry_date IS NULL OR v\.inspection_expiry_date >= DATE\(\?\)/);
   assert.equal((calls[0].sql.match(/JSON_CONTAINS/g) ?? []).length, 2);
   assert.deepEqual(calls[0].params, [
-    '4', 'A-1', '2026-11-02 09:00:00', '2026-11-01 09:00:00', '禁煙', 'ETC'
+    '4', 'A-1', '2026-11-02 09:00:00', '2026-11-01 09:00:00', '2026-11-02 09:00:00', '禁煙', 'ETC'
   ]);
+});
+
+test('reservation creation rejects a vehicle whose inspection expires mid-rental', async () => {
+  const db = {
+    transaction: async (callback) => callback({
+      query: async (sql) => {
+        if (sql.startsWith('INSERT INTO customers')) return { insertId: 72 };
+        if (sql.startsWith('SELECT id, site_id, status, inspection_expiry_date FROM vehicles')) {
+          return [{
+            id: 'vehicle-1', site_id: '4', status: 'available', inspection_expiry_date: '2026-11-01'
+          }];
+        }
+        throw new Error(`Unexpected SQL: ${sql}`);
+      }
+    })
+  };
+  const repository = createReservationRepository(db);
+  await assert.rejects(
+    repository.create({
+      siteId: '4', guestName: 'Guest', guestPhone: '+81-90-1234-5678',
+      startAt: '2026-11-01 09:00:00.000', endAt: '2026-11-02 09:00:00.000',
+      vehicleId: 'vehicle-1', createdBy: '3'
+    }),
+    (error) => error.code === 'ERP_CONFLICT' && /inspection expires/.test(error.message)
+  );
+});
+
+test('check-in rejects a vehicle whose inspection has already expired', async () => {
+  const calls = [];
+  const db = {
+    transaction: async (callback) => callback({
+      query: async (sql, params) => {
+        calls.push({ sql, params });
+        if (sql.startsWith('SELECT id, site_id, vehicle_id, status FROM reservations')) {
+          return [{ id: '15', site_id: '4', vehicle_id: 'vehicle-1', status: 'reserved' }];
+        }
+        if (sql.startsWith('SELECT id, name FROM site_employees')) {
+          return [{ id: '8', name: 'Store Staff' }];
+        }
+        if (sql.startsWith('SELECT id, site_id, status, inspection_expiry_date FROM vehicles')) {
+          return [{
+            id: 'vehicle-1', site_id: '4', status: 'available', inspection_expiry_date: '2000-01-01'
+          }];
+        }
+        return { affectedRows: 1 };
+      }
+    })
+  };
+  const repository = createReservationRepository(db);
+  await assert.rejects(
+    repository.transition({ id: '15', status: 'checked_in', siteId: '4', employeeId: '8' }),
+    (error) => error.code === 'ERP_CONFLICT' && /inspection has expired/.test(error.message)
+  );
+  assert.equal(calls.some(({ sql }) => sql.startsWith('UPDATE')), false);
 });
 
 test('checking in transitions vehicle status atomically with reservation', async () => {
@@ -140,7 +195,7 @@ test('checking in transitions vehicle status atomically with reservation', async
         if (sql.startsWith('SELECT id, name FROM site_employees')) {
           return [{ id: '8', name: 'Store Staff' }];
         }
-        if (sql.startsWith('SELECT id, site_id, status FROM vehicles')) {
+        if (sql.startsWith('SELECT id, site_id, status, inspection_expiry_date FROM vehicles')) {
           return [{ id: 'vehicle-1', site_id: '4', status: 'available' }];
         }
         return { affectedRows: 1 };

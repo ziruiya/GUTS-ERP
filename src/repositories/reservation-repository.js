@@ -1,4 +1,5 @@
 import { randomBytes } from 'node:crypto';
+import { dateOnly, inspectionValidThrough, tokyoToday } from '../services/compliance.js';
 
 function conflict(message) {
   return Object.assign(new Error(message), { code: 'ERP_CONFLICT' });
@@ -22,7 +23,7 @@ export function createReservationRepository(db) {
     },
 
     async listAvailableVehicles({ siteId, startAt, endAt, vehicleClass, options = [] }) {
-      const params = [siteId, vehicleClass, endAt, startAt];
+      const params = [siteId, vehicleClass, endAt, startAt, endAt];
       const optionFilters = options.map(() => 'JSON_CONTAINS(p.options, JSON_QUOTE(?))');
       params.push(...options);
       return db.query(
@@ -41,6 +42,7 @@ export function createReservationRepository(db) {
                WHERE r.vehicle_id = v.id AND r.status IN ('reserved', 'checked_in')
                  AND r.start_at < ? AND r.end_at > ?
             )
+            AND (v.inspection_expiry_date IS NULL OR v.inspection_expiry_date >= DATE(?))
             ${optionFilters.length ? `AND ${optionFilters.join(' AND ')}` : ''}
           ORDER BY v.registration_number, v.id
           LIMIT 200`,
@@ -102,11 +104,14 @@ export function createReservationRepository(db) {
           customer = { id: result.insertId, name: guestName, phone: guestPhone };
         }
         const [vehicle] = await tx.query(
-          'SELECT id, site_id, status FROM vehicles WHERE id = ? FOR UPDATE',
+          'SELECT id, site_id, status, inspection_expiry_date FROM vehicles WHERE id = ? FOR UPDATE',
           [vehicleId]
         );
         if (!vehicle || String(vehicle.site_id) !== String(siteId) || vehicle.status !== 'available') {
           throw conflict('Vehicle is unavailable at this site.');
+        }
+        if (!inspectionValidThrough(vehicle, endAt)) {
+          throw conflict('Vehicle inspection expires before the rental period ends.');
         }
         const overlap = await tx.query(
           `SELECT id FROM reservations
@@ -163,11 +168,15 @@ export function createReservationRepository(db) {
         if (status === 'checked_in') {
           if (!reservation.vehicle_id) throw conflict('Assign a vehicle before checking in.');
           const [vehicle] = await tx.query(
-            'SELECT id, site_id, status FROM vehicles WHERE id = ? FOR UPDATE',
+            'SELECT id, site_id, status, inspection_expiry_date FROM vehicles WHERE id = ? FOR UPDATE',
             [reservation.vehicle_id]
           );
           if (!vehicle || String(vehicle.site_id) !== String(reservation.site_id) || vehicle.status !== 'available') {
             throw conflict('Assigned vehicle is no longer available.');
+          }
+          const inspectionExpiry = dateOnly(vehicle.inspection_expiry_date);
+          if (inspectionExpiry && inspectionExpiry < tokyoToday()) {
+            throw conflict('Vehicle inspection has expired.');
           }
           await tx.query('UPDATE vehicles SET status = ? WHERE id = ?', ['rented', reservation.vehicle_id]);
         }
